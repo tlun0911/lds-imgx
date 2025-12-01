@@ -14,6 +14,7 @@ for modern formats (WebP, AVIF, JPEG) and responsive image generation.
 - 📊 **Progress tracking** with detailed output
 - 🎯 **Flexible patterns** - custom glob patterns
 - 📋 **Manifest generation** - JSON manifest for web integration
+- 📦 **File array processing** - process arrays of files/buffers programmatically
 
 ## Installation
 
@@ -258,6 +259,8 @@ const srcset = generateSrcset(manifest["photo.jpg"], "webp");
 
 ## API Usage
 
+### Directory-based Processing
+
 ```javascript
 import { imgx } from "lds-imgx";
 
@@ -272,6 +275,56 @@ const result = await imgx({
 
 console.log(`Processed ${result.processed} files`);
 console.log(`Skipped ${result.cached.length} cached files`);
+```
+
+### File Array Processing
+
+Process an array of files (paths or buffers) and get back transformed images with buffers and paths:
+
+```javascript
+import { imgxFromFiles } from "lds-imgx";
+import fs from "node:fs/promises";
+
+// Process file paths
+const result = await imgxFromFiles({
+  files: [
+    "/path/to/image1.jpg",
+    "/path/to/image2.png",
+  ],
+  output: "./processed",
+  sizes: [640, 1000, 1600],
+  formats: ["webp", "avif"],
+  quality: 80,
+  returnBuffers: true,
+  writeToDisk: true,
+});
+
+// Access processed files
+result.processedFiles.forEach((file) => {
+  console.log(`Original: ${file.originalIdentifier}`);
+  file.outputs.forEach((output) => {
+    console.log(`  ${output.format} ${output.width}x${output.height} - ${output.bytes} bytes`);
+    // Use output.buffer for in-memory operations
+    // Use output.path for file path
+  });
+});
+
+// Process from buffers (e.g., from file uploads)
+const imageBuffer = await fs.readFile("/path/to/image.jpg");
+const result2 = await imgxFromFiles({
+  files: [imageBuffer],
+  output: "./processed",
+  sizes: [640, 1000],
+  formats: ["webp"],
+  returnBuffers: true,
+  writeToDisk: true,
+});
+
+// Use buffers directly (e.g., upload to S3)
+result2.processedFiles[0].outputs.forEach((output) => {
+  // output.buffer contains the processed image
+  // output.path contains the file path if writeToDisk is true
+});
 ```
 
 ## Requirements

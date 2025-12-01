@@ -81,6 +81,32 @@ export type ImgxResult = {
   manifest?: ImageManifest;
 };
 
+// Types for file array processing
+export type ImgxFileInput = string | Buffer;
+
+export type ProcessedOutput = {
+  path: string;
+  buffer: Buffer;
+  width: number;
+  height: number;
+  format: string;
+  bytes: number;
+};
+
+export type ProcessedFile = {
+  originalPath: string;
+  originalIdentifier: string;
+  outputs: ProcessedOutput[];
+};
+
+export type ImgxFilesResult = {
+  processed: number;
+  processedFiles: ProcessedFile[];
+  skipped: Array<{ file: string; reason: string }>;
+  totalFound: number;
+  manifest?: ImageManifest;
+};
+
 // Helper functions for generating HTML
 export function generateSrcset(
   entries: ImageManifestEntry[],
@@ -573,6 +599,362 @@ export async function imgx(opts: ImgxOptions): Promise<ImgxResult> {
     files: results,
     skipped: skippedFiles,
     cached: cachedFiles,
+    totalFound: files.length,
+    manifest: Object.keys(manifest).length > 0 ? manifest : undefined,
+  };
+}
+
+export type ImgxFilesOptions = {
+  files: ImgxFileInput[];
+  output?: string; // optional if only returning buffers
+  width?: number; // default 1000
+  height?: number; // optional; used with fit:"inside"
+  sizes?: number[]; // multiple widths for responsive images
+  withoutEnlargement?: boolean; // default true
+  formats?: Array<"webp" | "avif" | "jpeg">; // default ["webp"]
+  suffix?: string; // filename suffix pattern (e.g., "{w}w")
+  quality?: number; // default 78 (for webp/avif/jpeg)
+  effort?: number; // default 6  (for webp/avif)
+  concurrency?: number; // default os.cpus().length
+  sharpCacheFiles?: number | false; // default 100
+  stripMetadata?: boolean; // default true
+  verbose?: boolean; // default false
+  quiet?: boolean; // default false
+  returnBuffers?: boolean; // default true
+  writeToDisk?: boolean; // default true (requires output)
+};
+
+export async function imgxFromFiles(
+  opts: ImgxFilesOptions
+): Promise<ImgxFilesResult> {
+  const {
+    files,
+    output,
+    width = 1000,
+    height,
+    sizes,
+    withoutEnlargement = true,
+    formats = ["webp"],
+    suffix = "{w}w",
+    quality = 78,
+    effort = 6,
+    concurrency = os.cpus().length,
+    sharpCacheFiles = 100,
+    stripMetadata = true,
+    verbose = false,
+    quiet = false,
+    returnBuffers = true,
+    writeToDisk = true,
+  } = opts;
+
+  // Validate options
+  if (writeToDisk && !output) {
+    throw new Error("output directory is required when writeToDisk is true");
+  }
+
+  // Configure Sharp cache and concurrency
+  if (sharpCacheFiles === false) {
+    sharp.cache(false);
+  } else {
+    sharp.cache({ files: sharpCacheFiles });
+  }
+  sharp.concurrency(concurrency);
+
+  if (files.length === 0) {
+    return {
+      processed: 0,
+      processedFiles: [],
+      skipped: [],
+      totalFound: 0,
+    };
+  }
+
+  const limit = pLimit(concurrency);
+  const processedFiles: ProcessedFile[] = [];
+  const skippedFiles: Array<{ file: string; reason: string }> = [];
+  const manifest: ImageManifest = {};
+
+  // Determine sizes to process
+  const sizesToProcess = sizes || [width];
+
+  // Generate settings hash for cache (if output is provided)
+  let cache: ImgxCache = {};
+  let cachePath: string | null = null;
+  let settingsHash: string | null = null;
+
+  if (output && writeToDisk) {
+    cachePath = path.join(output, ".imgx-cache.json");
+    cache = await loadCache(cachePath);
+    // Create a temporary ImgxOptions-like object for hash generation
+    const tempOpts: ImgxOptions = {
+      input: "",
+      output: output || "",
+      width,
+      height,
+      sizes,
+      formats,
+      suffix,
+      quality,
+      effort,
+      stripMetadata,
+      withoutEnlargement,
+    };
+    settingsHash = generateSettingsHash(tempOpts);
+  }
+
+  if (!quiet && !verbose) {
+    console.log(`Processing ${files.length} files...`);
+  }
+
+  await Promise.all(
+    files.map((fileInput, index) =>
+      limit(async () => {
+        let inputBuffer: Buffer;
+        let originalPath: string;
+        let originalIdentifier: string;
+
+        try {
+          // Handle string (file path) or Buffer input
+          if (typeof fileInput === "string") {
+            originalPath = fileInput;
+            originalIdentifier = path.basename(fileInput);
+            inputBuffer = await fs.readFile(fileInput);
+          } else {
+            // Buffer input - generate identifier
+            originalPath = `buffer-${index}`;
+            originalIdentifier = `buffer-${index}`;
+            inputBuffer = fileInput;
+          }
+
+          // Generate base name for outputs
+          const baseName = originalIdentifier.replace(/\.[^.]+$/, "");
+          const outBase = output
+            ? path.join(output, baseName)
+            : path.join(os.tmpdir(), `imgx-${Date.now()}-${baseName}`);
+
+          const processedOutputs: ProcessedOutput[] = [];
+          const allOutputs: string[] = [];
+
+          // Generate all expected output paths
+          for (const size of sizesToProcess) {
+            const sizeSuffix = suffix.replace("{w}", size.toString());
+            for (const fmt of formats) {
+              const outPath = `${outBase}-${sizeSuffix}.${fmt}`;
+              allOutputs.push(outPath);
+            }
+          }
+
+          // Check cache if output directory is provided
+          if (output && writeToDisk && settingsHash) {
+            const skipCheck = await shouldSkipFile(
+              originalPath,
+              allOutputs,
+              settingsHash,
+              false,
+              cache
+            );
+            if (skipCheck.skip) {
+              skippedFiles.push({
+                file: originalIdentifier,
+                reason: skipCheck.reason || "cached",
+              });
+
+              // Load existing files from cache
+              if (returnBuffers) {
+                for (const outputFile of allOutputs) {
+                  try {
+                    const buffer = await fs.readFile(outputFile);
+                    const metadata = await sharp(buffer).metadata();
+                    const format = path.extname(outputFile).slice(1);
+                    const sizeMatch = outputFile.match(/-(\d+)w\./);
+                    const width = sizeMatch
+                      ? parseInt(sizeMatch[1])
+                      : metadata.width || 0;
+
+                    processedOutputs.push({
+                      path: outputFile,
+                      buffer,
+                      width,
+                      height: metadata.height || 0,
+                      format,
+                      bytes: buffer.length,
+                    });
+                  } catch {
+                    // If we can't read, skip this output
+                  }
+                }
+              }
+
+              if (processedOutputs.length > 0) {
+                processedFiles.push({
+                  originalPath,
+                  originalIdentifier,
+                  outputs: processedOutputs,
+                });
+              }
+
+              if (verbose) {
+                console.log(
+                  `⚡ ${originalIdentifier} - ${skipCheck.reason || "cached"}`
+                );
+              }
+              return;
+            }
+          }
+
+          // Process each size
+          for (const size of sizesToProcess) {
+            const sizeSuffix = suffix.replace("{w}", size.toString());
+
+            for (const fmt of formats) {
+              const outPath = `${outBase}-${sizeSuffix}.${fmt}`;
+              const outDir = path.dirname(outPath);
+
+              if (writeToDisk) {
+                await fs.mkdir(outDir, { recursive: true });
+              }
+
+              // Process image with Sharp
+              let instance = sharp(inputBuffer, { failOn: "none" }).rotate();
+
+              if (stripMetadata) {
+                instance = instance.withMetadata({
+                  exif: undefined,
+                  icc: undefined,
+                });
+              }
+
+              instance = instance.resize({
+                width: size,
+                height,
+                fit: "inside",
+                withoutEnlargement,
+              });
+
+              if (fmt === "webp") {
+                instance = instance.webp({
+                  quality,
+                  effort,
+                  smartSubsample: true,
+                });
+              } else if (fmt === "avif") {
+                instance = instance.avif({
+                  quality: Math.min(quality, 60),
+                  effort: Math.min(effort, 6),
+                });
+              } else if (fmt === "jpeg") {
+                instance = instance.jpeg({ quality, mozjpeg: true });
+              }
+
+              const buffer = await instance.toBuffer();
+
+              // Write to disk if requested
+              if (writeToDisk) {
+                await fs.writeFile(outPath, buffer);
+              }
+
+              // Get image metadata
+              const metadata = await sharp(buffer).metadata();
+
+              // Add to processed outputs
+              processedOutputs.push({
+                path: writeToDisk ? outPath : "",
+                buffer: returnBuffers ? buffer : Buffer.alloc(0),
+                width: metadata.width || size,
+                height: metadata.height || 0,
+                format: fmt,
+                bytes: buffer.length,
+              });
+            }
+          }
+
+          processedFiles.push({
+            originalPath,
+            originalIdentifier,
+            outputs: processedOutputs,
+          });
+
+          // Update cache if output directory is provided
+          if (output && writeToDisk && settingsHash && typeof fileInput === "string") {
+            const cacheKey = path.relative(process.cwd(), originalPath);
+            try {
+              const inputStats = await fs.stat(originalPath);
+              cache[cacheKey] = {
+                inputPath: originalPath,
+                inputMtime: inputStats.mtime.getTime(),
+                settingsHash,
+                outputFiles: allOutputs,
+                timestamp: Date.now(),
+              };
+            } catch {
+              // If we can't stat the file, skip cache update
+            }
+          }
+
+          // Add to manifest
+          const manifestEntries: ImageManifestEntry[] = processedOutputs.map(
+            (out) => ({
+              src: writeToDisk && output
+                ? path.relative(output, out.path).replace(/\\/g, "/")
+                : out.path,
+              width: out.width,
+              height: out.height,
+              format: out.format,
+              bytes: out.bytes,
+              originalFile: originalIdentifier,
+            })
+          );
+          manifest[originalIdentifier] = manifestEntries;
+
+          if (verbose) {
+            console.log(
+              `✔ ${originalIdentifier} → ${processedOutputs.length} variants`
+            );
+          }
+        } catch (error: any) {
+          const reason = error.message || "Unknown error";
+          const identifier =
+            typeof fileInput === "string"
+              ? path.basename(fileInput)
+              : `buffer-${index}`;
+          skippedFiles.push({ file: identifier, reason });
+
+          if (verbose) {
+            console.log(`✗ ${identifier} - Skipped: ${reason}`);
+          }
+        }
+      })
+    )
+  );
+
+  // Save cache file if output directory is provided
+  if (output && writeToDisk && cachePath) {
+    await saveCache(cachePath, cache);
+  }
+
+  // Write manifest file if output directory is provided and we have entries
+  if (output && writeToDisk && Object.keys(manifest).length > 0) {
+    const manifestPath = path.join(output, "imgx-manifest.json");
+    await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+
+    if (!quiet) {
+      console.log(
+        `\nManifest written to: ${path.relative(process.cwd(), manifestPath)}`
+      );
+    }
+  }
+
+  // Final progress update
+  if (!quiet && !verbose) {
+    console.log(
+      `Completed: ${processedFiles.length}/${files.length} files processed`
+    );
+  }
+
+  return {
+    processed: processedFiles.length,
+    processedFiles,
+    skipped: skippedFiles,
     totalFound: files.length,
     manifest: Object.keys(manifest).length > 0 ? manifest : undefined,
   };
